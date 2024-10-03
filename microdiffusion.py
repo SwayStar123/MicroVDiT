@@ -10,7 +10,8 @@ from lightning.pytorch.loggers import TensorBoardLogger
 
 bs = 64
 input_dim = 4  # 4 channels in latent space
-patch_size = 1 
+patch_size = 1
+patch_size = (1, patch_size, patch_size) 
 embed_dim = 384
 num_layers = 12
 num_heads = 6

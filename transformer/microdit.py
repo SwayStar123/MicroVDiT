@@ -1,5 +1,5 @@
 import torch.nn as nn
-from .embed import PatchEmbed, get_2d_sincos_pos_embed
+from .embed import PatchEmbed, get_3d_sincos_pos_embed
 from .utils import random_mask, remove_masked_patches, add_masked_patches, unpatchify, strings_to_tensor
 from .backbone import TransformerBackbone
 from .moedit import TimestepEmbedder
@@ -20,7 +20,7 @@ class PatchMixer(nn.Module):
             x = layer(x)
         return x
 
-class MicroDiT(nn.Module):
+class MicroVDiT(nn.Module):
     def __init__(self, in_channels, patch_size, embed_dim, num_layers, num_heads, mlp_dim, class_label_dim, 
                  num_experts=4, active_experts=2, dropout=0.1, patch_mixer_layers=2):
         super().__init__()
@@ -79,12 +79,12 @@ class MicroDiT(nn.Module):
         )
 
     def forward(self, x, t, class_labels, mask=None):
-        # x: (batch_size, in_channels, height, width)
+        # x: (batch_size, in_channels, depth, height, width)
         # t: (batch_size, 1)
         # class_labels: (batch_size, class_embed_dim)
         # mask: (batch_size, num_patches)
         
-        batch_size, channels, height, width = x.shape
+        batch_size, channels, depth, height, width = x.shape
 
         # if mask is None:
             # mask = random_mask(batch_size, height, width, self.patch_size, 1., x.device)
@@ -93,7 +93,7 @@ class MicroDiT(nn.Module):
         x = self.patch_embed(x)  # (batch_size, num_patches, embed_dim)
         
         # Generate positional embeddings
-        pos_embed = get_2d_sincos_pos_embed(self.embed_dim, height // self.patch_size, width // self.patch_size)
+        pos_embed = get_3d_sincos_pos_embed(self.embed_dim, depth, height // self.patch_size, width // self.patch_size)
         pos_embed = pos_embed.to(x.device).unsqueeze(0)
         
         x = x + pos_embed

@@ -4,15 +4,27 @@ import torch.nn as nn
 class PatchEmbed(nn.Module):
     def __init__(self, in_channels, embed_dim, patch_size):
         super().__init__()
-        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+        # Changed from Conv2d to Conv3d to handle video depth
+        if isinstance(patch_size, int):
+            patch_size = (1, patch_size, patch_size)  # (D, H, W)
+        self.proj = nn.Conv3d(
+            in_channels, 
+            embed_dim, 
+            kernel_size=patch_size, 
+            stride=patch_size
+        )
         self.patch_size = patch_size
 
     def forward(self, x):
-        x = self.proj(x)  # (B, C, H, W) -> (B, E, H', W')
-        return x.flatten(2).transpose(1, 2)  # (B, E, H', W') -> (B, H'*W', E)
+        """
+        Args:
+            x: Tensor of shape (B, C, D, H, W)
+        Returns:
+            Tensor of shape (B, N, E) where N = D'*H'*W'
+        """
+        x = self.proj(x)  # (B, C, D, H, W) -> (B, E, D', H', W')
+        return x.flatten(2).transpose(1, 2)  # (B, E, D'*H'*W') -> (B, D'*H'*W', E)
     
-
-
 def get_2d_sincos_pos_embed(embed_dim, h, w):
     """
     :param embed_dim: dimension of the embedding
