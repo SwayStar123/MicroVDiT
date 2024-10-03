@@ -12,6 +12,7 @@ class PatchEmbed(nn.Module):
         return x.flatten(2).transpose(1, 2)  # (B, E, H', W') -> (B, H'*W', E)
     
 
+
 def get_2d_sincos_pos_embed(embed_dim, h, w):
     """
     :param embed_dim: dimension of the embedding
@@ -76,4 +77,33 @@ def get_timestep_embedding(timesteps, embedding_dim):
     emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
     if embedding_dim % 2 == 1:  # zero pad
         emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
+    return emb
+
+def get_3d_sincos_pos_embed(embed_dim, d, h, w):
+    """
+    :param embed_dim: dimension of the embedding
+    :param d: depth (temporal dimension) of the grid
+    :param h: height of the grid
+    :param w: width of the grid
+    :return: [d*h*w, embed_dim] or [1+d*h*w, embed_dim] (w/ or w/o cls_token)
+    """
+    grid_d = torch.arange(d, dtype=torch.float32)
+    grid_h = torch.arange(h, dtype=torch.float32)
+    grid_w = torch.arange(w, dtype=torch.float32)
+    grid = torch.meshgrid(grid_d, grid_h, grid_w, indexing='ij')
+    grid = torch.stack(grid, dim=0)
+
+    grid = grid.reshape([3, 1, d, h, w])
+    pos_embed = get_3d_sincos_pos_embed_from_grid(embed_dim, grid)
+    return pos_embed
+
+def get_3d_sincos_pos_embed_from_grid(embed_dim, grid):
+    assert embed_dim % 3 == 0
+
+    # use one third of dimensions to encode each of grid_d, grid_h, grid_w
+    emb_d = get_1d_sincos_pos_embed_from_grid(embed_dim // 3, grid[0])  # (D*H*W, D/3)
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 3, grid[1])  # (D*H*W, D/3)
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 3, grid[2])  # (D*H*W, D/3)
+
+    emb = torch.cat([emb_d, emb_h, emb_w], dim=1)  # (D*H*W, D)
     return emb
