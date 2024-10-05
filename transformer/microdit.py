@@ -1,6 +1,6 @@
 import torch.nn as nn
 from .embed import PatchEmbed, get_3d_sincos_pos_embed
-from .utils import random_mask, remove_masked_patches, add_masked_patches, unpatchify, strings_to_tensor
+from .utils import random_mask, remove_masked_patches, add_masked_patches, unpatchify, strings_to_tensor, apply_mask_to_tensor
 from .backbone import TransformerBackbone
 from .moedit import TimestepEmbedder
 import lightning as L
@@ -21,61 +21,102 @@ class PatchMixer(nn.Module):
         return x
 
 class MicroVDiT(nn.Module):
-    def __init__(self, in_channels, patch_size, embed_dim, num_layers, num_heads, mlp_dim, class_label_dim, 
-                 num_experts=4, active_experts=2, dropout=0.1, patch_mixer_layers=2):
+    """
+    MicroVDiT is a video diffusion transformer model.
+
+    Args:
+        in_channels (int): Number of input channels in the video data.
+        patch_size (tuple of int): Size of the patches to be extracted from the video.
+        embed_dim (int): Dimension of the embedding space.
+        num_layers (int): Number of layers in the transformer backbone.
+        num_heads (int): Number of attention heads in the multi-head attention mechanism.
+        mlp_dim (int): Dimension of the multi-layer perceptron.
+        class_label_dim (int): Dimension of the class labels.
+        num_experts (int, optional): Number of experts in the transformer backbone. Default is 4.
+        active_experts (int, optional): Number of active experts in the transformer backbone. Default is 2.
+        dropout (float, optional): Dropout rate. Default is 0.1.
+        patch_mixer_layers (int, optional): Number of layers in the patch mixer. Default is 2.
+        embed_cat (bool, optional): Whether to concatenate embeddings. Default is False. If true, the timestep, class, and positional embeddings are concatenated rather than summed.
+
+    Attributes:
+        patch_size (tuple of int): Size of the patches to be extracted from the video.
+        embed_dim (int): Dimension of the embedding space.
+        patch_embed (PatchEmbed): Patch embedding layer.
+        time_embed (TimestepEmbedder): Timestep embedding layer.
+        class_embed (nn.Sequential): Class embedding layer.
+        mha (nn.MultiheadAttention): Multi-head attention mechanism.
+        mlp (nn.Sequential): Multi-layer perceptron for processing embeddings.
+        pool_mlp (nn.Sequential): Pooling and multi-layer perceptron for (MHA + MLP).
+        linear (nn.Linear): Linear layer after MHA+MLP.
+        patch_mixer (PatchMixer): Patch mixer layer.
+        backbone (TransformerBackbone): Transformer backbone model.
+    """
+    def __init__(self, in_channels, patch_size, embed_dim, num_layers, num_heads, mlp_dim, class_label_dim=None, timestep_class_embed_dim=None, pos_embed_dim=None,
+                 num_experts=4, active_experts=2, dropout=0.1, patch_mixer_layers=2, embed_cat=False):
         super().__init__()
         
         self.patch_size = patch_size
         self.embed_dim = embed_dim
-        
+        self.class_label_dim = class_label_dim
+        self.embed_cat = embed_cat
+
+        if self.embed_cat:
+            self.pos_embed_dim = pos_embed_dim if pos_embed_dim is not None else embed_dim
+            self.timestep_class_embed_dim = timestep_class_embed_dim if timestep_class_embed_dim is not None else embed_dim
+            self.total_embed_dim = self.timestep_class_embed_dim + self.pos_embed_dim + embed_dim
+        else:
+            self.pos_embed_dim = embed_dim
+            self.timestep_class_embed_dim = embed_dim
+            self.total_embed_dim = embed_dim
+
         # Image processing
         self.patch_embed = PatchEmbed(in_channels, embed_dim, patch_size)
         
         # Timestep embedding
-        self.time_embed = TimestepEmbedder(embed_dim)
+        self.time_embed = TimestepEmbedder(self.timestep_class_embed_dim)
         
         # Class embedding
         # self.class_embed = nn.Linear(class_label_dim, embed_dim)
         self.class_embed = nn.Sequential(
-            nn.Linear(class_label_dim, embed_dim),
+            nn.Linear(self.class_label_dim, self.timestep_class_embed_dim),
             nn.GELU(),
-            nn.Linear(embed_dim, embed_dim)
+            nn.Linear(self.timestep_class_embed_dim, self.timestep_class_embed_dim)
         )
 
         # MHA for timestep and class
-        self.mha = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
-        
+        self.mha = nn.MultiheadAttention(self.timestep_class_embed_dim, num_heads, batch_first=True)
+
         # MLP for timestep and class
         self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(self.timestep_class_embed_dim, self.timestep_class_embed_dim),
             nn.GELU(),
-            nn.Linear(embed_dim, embed_dim)
+            nn.Linear(self.timestep_class_embed_dim, self.timestep_class_embed_dim)
         )
         
         # Pool + MLP for (MHA + MLP)
         self.pool_mlp = nn.Sequential(
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten(),
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(self.timestep_class_embed_dim, self.timestep_class_embed_dim),
             nn.GELU(),
-            nn.Linear(embed_dim, embed_dim)
+            nn.Linear(self.timestep_class_embed_dim, self.timestep_class_embed_dim)
         )
         
         # Linear layer after MHA+MLP
-        self.linear = nn.Linear(embed_dim, embed_dim)
+        self.linear = nn.Linear(self.timestep_class_embed_dim, self.timestep_class_embed_dim)
         
         # Patch-mixer
-        self.patch_mixer = PatchMixer(embed_dim, num_heads, patch_mixer_layers)
+        self.patch_mixer = PatchMixer(self.total_embed_dim, num_heads, patch_mixer_layers)
         
         # Backbone transformer model
-        self.backbone = TransformerBackbone(embed_dim, embed_dim, num_layers, num_heads, mlp_dim, 
+        self.backbone = TransformerBackbone(self.total_embed_dim, self.total_embed_dim, self.timestep_class_embed_dim, num_layers, num_heads, mlp_dim, 
                                         num_experts, active_experts, dropout)
         
         # Output layer
         self.output = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(self.total_embed_dim, embed_dim),
             nn.GELU(),
-            nn.Linear(embed_dim, patch_size * patch_size * in_channels)
+            nn.Linear(embed_dim, patch_size[0] * patch_size[1] * patch_size[2] * in_channels)
         )
 
     def forward(self, x, t, class_labels, mask=None):
@@ -86,23 +127,26 @@ class MicroVDiT(nn.Module):
         
         batch_size, channels, depth, height, width = x.shape
 
-        # if mask is None:
-            # mask = random_mask(batch_size, height, width, self.patch_size, 1., x.device)
+        patch_size_d, patch_size_h, patch_size_w = self.patch_size
 
         # Image processing
         x = self.patch_embed(x)  # (batch_size, num_patches, embed_dim)
         
         # Generate positional embeddings
-        pos_embed = get_3d_sincos_pos_embed(self.embed_dim, depth, height // self.patch_size, width // self.patch_size)
-        pos_embed = pos_embed.to(x.device).unsqueeze(0)
+        # (depth // patch_size_d, height // patch_size_h, width // patch_size_w, pos_embed_dim)
+        pos_embed = get_3d_sincos_pos_embed(self.pos_embed_dim, depth // patch_size_d, height // patch_size_h, width // patch_size_w)
+        pos_embed = pos_embed.to(x.device).unsqueeze(0).expand(batch_size, -1, -1)
         
-        x = x + pos_embed
+        if self.embed_cat:
+            x = torch.cat((x, pos_embed), dim=-1)
+        else:
+            x = x + pos_embed
         
         # Timestep embedding
-        t_emb = self.time_embed(t)  # (batch_size, embed_dim)
+        t_emb = self.time_embed(t)  # (batch_size, timestep_class_embed_dim)
 
         # Class embedding
-        c_emb = self.class_embed(class_labels)  # (batch_size, embed_dim)
+        c_emb = self.class_embed(class_labels)  # (batch_size, timestep_class_embed_dim)
 
         mha_out = self.mha(t_emb.unsqueeze(1), c_emb.unsqueeze(1), c_emb.unsqueeze(1))[0].squeeze(1)
         mlp_out = self.mlp(mha_out)
@@ -114,13 +158,15 @@ class MicroVDiT(nn.Module):
         pool_out = (pool_out + t_emb).unsqueeze(1)
         
         # Apply linear layer
-        cond_signal = self.linear(mlp_out).unsqueeze(1)  # (batch_size, 1, embed_dim)
+        cond_signal = self.linear(mlp_out).unsqueeze(1)  # (batch_size, 1, timestep_class_embed_dim)
+        cond = (cond_signal + pool_out).expand(-1, x.shape[1], -1)
         
         # Add conditioning signal to all patches
-        x = x + cond_signal + pool_out
-
-        # cond = t_emb.unsqueeze(1) + c_emb.unsqueeze(1) + pos_embed
-        # x = x + cond
+        # (batch_size, num_patches, embed_dim + pos_embed_dim) -> (batch_size, num_patches, total_embed_dim)
+        if self.embed_cat:
+            x = torch.cat((x, cond), dim=-1)
+        else:
+            x = x + cond
 
         # Patch-mixer
         x = self.patch_mixer(x)
@@ -130,28 +176,32 @@ class MicroVDiT(nn.Module):
             x = remove_masked_patches(x, mask)
 
         # MHA + MLP + Pool + MLP + t_emb
-        x = x + mlp_out.unsqueeze(1) + pool_out
+        cond = (mlp_out + pool_out).expand(-1, x.shape[1], -1)
+        if self.embed_cat:
+            x[:, :, :, -self.timestep_class_embed_dim:] = x[:, :, :, -self.timestep_class_embed_dim:] + cond
+        else:
+            x = x + cond
 
         # Backbone transformer model
         x = self.backbone(x, c_emb)
         
         # Final output layer
-        # (bs, unmasked_num_patches, embed_dim) -> (bs, unmasked_num_patches, patch_size * patch_size * in_channels)
+        # (bs, unmasked_num_patches, total_embed_dim) -> (bs, unmasked_num_patches, patch_size_D, patch_size_H * patch_size_W * in_channels)
         x = self.output(x)
 
         # Add masked patches
         if mask is not None:
-            # (bs, unmasked_num_patches, patch_size * patch_size * in_channels) -> (bs, num_patches, patch_size * patch_size * in_channels)
+            # (bs, unmasked_num_patches, patch_size_D * patch_size_H * patch_size_W * in_channels) -> (bs, num_patches, patch_size_D * patch_size_H * patch_size_W * in_channels)
             x = add_masked_patches(x, mask)
 
-        x = unpatchify(x, self.patch_size, height, width)
+        x = unpatchify(x, self.patch_size, depth, height, width)
         
         return x
 
 latents_mean = torch.tensor(-0.57)
 latents_std = torch.tensor(6.91)
 
-class LitMicroDiT(L.LightningModule):
+class LitMicroVDiT(L.LightningModule):
     def __init__(self, model, train_ds, learning_rate=1e-4, batch_size=1, ln=True, mask_ratio=0.5):
         super().__init__()
         self.model = model
@@ -184,7 +234,7 @@ class LitMicroDiT(L.LightningModule):
         image_prompts = strings_to_tensor(batch["prompt_string"]).to(self.device)
         latents = (latents - latents_mean) / latents_std
 
-        mask = random_mask(bs, latents.shape[-2], latents.shape[-1], self.model.patch_size, mask_ratio=self.mask_ratio).to(self.device)
+        mask = random_mask(bs, latents.shape[-4], latents.shape[-2], latents.shape[-1], self.model.patch_size, mask_ratio=self.mask_ratio).to(self.device)
 
         if self.ln:
             nt = torch.randn((bs,)).to(self.device)
@@ -196,9 +246,9 @@ class LitMicroDiT(L.LightningModule):
         zt = (1 - texp) * latents + texp * z1
         
         vtheta = self.model(zt, t, image_prompts, mask)
-        latents = latents * mask.unsqueeze(1).view(bs, 1, latents.shape[-2], latents.shape[-1])
-        vtheta = vtheta * mask.unsqueeze(1).view(bs, 1, vtheta.shape[-2], vtheta.shape[-1])
-        z1 = z1 * mask.unsqueeze(1).view(bs, 1, z1.shape[-2], z1.shape[-1])
+        latents = apply_mask_to_tensor(latents, mask, self.model.patch_size)
+        vtheta = apply_mask_to_tensor(vtheta, mask, self.model.patch_size)
+        z1 = apply_mask_to_tensor(z1, mask, self.model.patch_size)
 
         batchwise_mse = ((z1 - latents - vtheta) ** 2).mean(dim=list(range(1, len(latents.shape))))
         loss = batchwise_mse.mean()
